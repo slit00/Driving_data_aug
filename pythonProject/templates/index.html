@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Interactive Map with Stop Time and Speed Editing</title>
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <style>
+        .popup-button {
+            display: block;
+            width: 100%;
+            margin-top: 5px;
+        }
+        .speed-buttons, .time-buttons {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 10px;
+        }
+        .speed-button, .time-button {
+            flex: 1;
+            margin: 2px;
+            padding: 5px;
+            text-align: center;
+            background-color: #f0f0f0;
+            border: 1px solid #ccc;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body>
+    <h1>Interactive Map with Stop Time and Speed Editing</h1>
+    <div id="map" style="width: 100%; height: 600px;"></div>
+    <button id="save-btn">Save to CSV</button>
+    <button id="delete-all-btn">Delete All Markers</button>
+    <button id="sync-btn">Sync Markers with Server</button>
+
+    <script>
+        document.addEventListener('DOMContentLoaded', function() {
+            var map = L.map('map').setView([35.8714, 128.6014], 15);
+
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                maxZoom: 20,
+                minZoom: 1,
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            }).addTo(map);
+
+            var markers = {};  // 모든 마커를 저장하는 객체
+            var polylines = []; // 모든 경로(Polyline)을 저장하는 리스트
+
+            function catmullRomSpline(points) {
+                if (points.length < 2) return [];
+
+                let result = [];
+                for (let i = 0; i < points.length - 1; i++) {
+                    const p0 = i > 0 ? points[i - 1] : points[i];
+                    const p1 = points[i];
+                    const p2 = points[i + 1];
+                    const p3 = i !== points.length - 2 ? points[i + 2] : p2;
+
+                    const numOfSegments = 20; // 세그먼트 수
+                    for (let t = 0; t <= numOfSegments; t++) {
+                        const t1 = t / numOfSegments;
+                        const t2 = t1 * t1;
+                        const t3 = t2 * t1;
+
+                        const x = 0.5 * ((2 * p1.lng) + (-p0.lng + p2.lng) * t1 +
+                            (2 * p0.lng - 5 * p1.lng + 4 * p2.lng - p3.lng) * t2 +
+                            (-p0.lng + 3 * p1.lng - 3 * p2.lng + p3.lng) * t3);
+
+                        const y = 0.5 * ((2 * p1.lat) + (-p0.lat + p2.lat) * t1 +
+                            (2 * p0.lat - 5 * p1.lat + 4 * p2.lat - p3.lat) * t2 +
+                            (-p0.lat + 3 * p1.lat - 3 * p2.lat + p3.lat) * t3);
+
+                        result.push([y, x]);
+                    }
+                }
+                return result;
+            }
+
+            function drawSpline() {
+                polylines.forEach(function(line) {
+                    map.removeLayer(line);
+                });
+                polylines = [];
+
+                var points = Object.values(markers).map(marker => marker.getLatLng());
+
+                var splinePoints = catmullRomSpline(points);
+
+                var polyline = L.polyline(splinePoints, {
+                    color: 'blue',
+                    weight: 3,
+                    smoothFactor: 1,
+                }).addTo(map);
+
+                polylines.push(polyline);
+
+                for (let i = 0; i < points.length - 1; i++) {
+                    var segment = L.polyline([points[i], points[i + 1]], {
+                        color: 'transparent',
+                        weight: 10,
+                        opacity: 0.0
+                    }).addTo(map);
+
+                    segment.on('click', function(e) {
+                        var newLatLng = e.latlng;
+                        insertMarkerAtPosition(i + 1, newLatLng);
+                    });
+
+                    polylines.push(segment);
+                }
+            }
+
+            function onMapClick(e) {
+                var lat = e.latlng.lat;
+                var lon = e.latlng.lng;
+
+                addMarker(lat, lon);
+            }
+
+            map.on('click', onMapClick);
+
+            function addMarker(lat, lon) {
+                var index = Object.keys(markers).length + 1;
+
+                fetch('/add_marker', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ index: index, lat: lat, lon: lon, speed: 0, stop_time: 0 }),
+                })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        markers[index] = createMarker(lat, lon, index);
+                        drawSpline();
+                    }
+                });
+            }
+
+            function insertMarkerAtPosition(index, latlng) {
+                if (markers[index]) {
+                    return;
+                }
+
+                for (let i = Object.keys(markers).length; i >= index; i--) {
+                    markers[i + 1] = markers[i];
+                    markers[i + 1].unbindPopup();
+                    markers[i + 1].bindPopup(getPopupContent(i + 1));
+                }
+
+                markers[index] = createMarker(latlng.lat, latlng.lng, index);
+                drawSpline();
+            }
+
+            function createMarker(lat, lon, index) {
+                var marker = L.marker([lat, lon], {
+                    draggable: true,
+                    index: index,
+                    speed: 0,
+                    stop_time: 0
+                }).addTo(map);
+
+                marker.on('click', function() {
+                    marker.bindPopup(getPopupContent(index)).openPopup();
+                });
+
+                marker.on('dragend', function(event) {
+                    var position = marker.getLatLng();
+                    lat = position.lat;
+                    lon = position.lng;
+
+                    fetch('/update_marker', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ index: index, lat: lat, lon: lon, speed: marker.options.speed, stop_time: marker.options.stop_time }),
+                    }).then(() => drawSpline());
+                });
+
+                markers[index] = marker;
+                return marker;
+            }
+
+            function getPopupContent(index) {
+                return `
+                    <div>
+                        Index: ${index}<br>
+                        Latitude: ${markers[index] ? markers[index].getLatLng().lat : ''}<br>
+                        Longitude: ${markers[index] ? markers[index].getLatLng().lng : ''}<br>
+                        Speed: ${markers[index] ? markers[index].options.speed : 0} km/h<br>
+                        Stop Time: ${markers[index] ? markers[index].options.stop_time : 0} min<br>
+                        <button class="popup-button" onclick="setSpeed(${index})">Set Speed</button>
+                        <button class="popup-button" onclick="setStopTime(${index})">Set Stop Time</button>
+                        <button class="popup-button" onclick="deleteMarker(${index})">Delete Marker</button>
+                    </div>
+                `;
+            }
+
+            window.setSpeed = function(index) {
+                var tensDigit = null;
+                var onesDigit = null;
+
+                var popupContent = `
+                    <div>
+                        <strong>Choose speed:</strong><br>
+                        <div class="speed-buttons">
+                            <div class="speed-button" onclick="selectTens(${index}, 0)">0</div>
+                            <div class="speed-button" onclick="selectTens(${index}, 1)">1</div>
+                            <div class="speed-button" onclick="selectTens(${index}, 2)">2</div>
+                            <div class="speed-button" onclick="selectTens(${index}, 3)">3</div>
+                        </div>
+                    </div>
+                `;
+
+                markers[index].setPopupContent(popupContent);
+                markers[index].openPopup();
+
+                L.DomEvent.disableClickPropagation(markers[index].getPopup().getElement());
+                L.DomEvent.on(markers[index].getPopup().getElement(), 'click', L.DomEvent.stopPropagation);
+
+                window.selectTens = function(index, digit) {
+                    tensDigit = digit;
+                    showOnesDigitSelection(index, tensDigit);
+                };
+
+                function showOnesDigitSelection(index, tensDigit) {
+                    var popupContent = `
+                        <div>
+                            <strong>Choose speed:</strong><br>
+                            Tens digit: ${tensDigit}<br>
+                            <div class="speed-buttons">
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 0)">0</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 1)">1</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 2)">2</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 3)">3</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 4)">4</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 5)">5</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 6)">6</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 7)">7</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 8)">8</div>
+                                <div class="speed-button" onclick="confirmSpeed(${index}, ${tensDigit}, 9)">9</div>
+                            </div>
+                        </div>
+                    `;
+                    markers[index].setPopupContent(popupContent);
+                    markers[index].openPopup();
+
+                    L.DomEvent.disableClickPropagation(markers[index].getPopup().getElement());
+                    L.DomEvent.on(markers[index].getPopup().getElement(), 'click', L.DomEvent.stopPropagation);
+                }
+
+                window.confirmSpeed = function(index, tensDigit, onesDigit) {
+                    var speed = tensDigit * 10 + onesDigit;
+                    var marker = markers[index];
+                    var lat = marker.getLatLng().lat;
+                    var lon = marker.getLatLng().lng;
+
+                    marker.setPopupContent(`
+                        Index: ${index}<br>
+                        Latitude: ${lat}<br>
+                        Longitude: ${lon}<br>
+                        Speed: ${speed} km/h<br>
+                        Stop Time: ${markers[index].options.stop_time} min<br>
+                        <button class="popup-button" onclick="setSpeed(${index})">Set Speed</button>
+                        <button class="popup-button" onclick="setStopTime(${index})">Set Stop Time</button>
+                        <button class="popup-button" onclick="deleteMarker(${index})">Delete Marker</button>
+                    `);
+                    marker.openPopup();
+
+                    markers[index].options.speed = speed;
+
+                    fetch('/update_marker', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ index: index, lat: lat, lon: lon, speed: speed, stop_time: markers[index].options.stop_time }),
+                    }).then(() => drawSpline());
+                };
+            };
+
+            window.setStopTime = function(index) {
+                var minutes = null;
+                var seconds = null;
+
+                var popupContent = `
+                    <div>
+                        <strong>Choose stop time:</strong><br>
+                        <div class="time-buttons">
+                            <div class="time-button" onclick="selectMinutes(${index}, 0)">0 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 1)">1 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 2)">2 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 3)">3 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 4)">4 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 5)">5 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 6)">6 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 7)">7 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 8)">8 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 9)">9 min</div>
+                            <div class="time-button" onclick="selectMinutes(${index}, 10)">10 min</div>
+                        </div>
+                    </div>
+                `;
+
+                markers[index].setPopupContent(popupContent);
+                markers[index].openPopup();
+
+                L.DomEvent.disableClickPropagation(markers[index].getPopup().getElement());
+                L.DomEvent.on(markers[index].getPopup().getElement(), 'click', L.DomEvent.stopPropagation);
+
+                window.selectMinutes = function(index, min) {
+                    minutes = min;
+                    showSecondsSelection(index, minutes);
+                };
+
+                function showSecondsSelection(index, minutes) {
+                    var popupContent = `
+                        <div>
+                            <strong>Choose stop time:</strong><br>
+                            Minutes: ${minutes} min<br>
+                            <div class="time-buttons">
+                                <div class="time-button" onclick="confirmStopTime(${index}, ${minutes}, 0)">0 sec</div>
+                                <div class="time-button" onclick="confirmStopTime(${index}, ${minutes}, 10)">10 sec</div>
+                                <div class="time-button" onclick="confirmStopTime(${index}, ${minutes}, 20)">20 sec</div>
+                                <div class="time-button" onclick="confirmStopTime(${index}, ${minutes}, 30)">30 sec</div>
+                                <div class="time-button" onclick="confirmStopTime(${index}, ${minutes}, 40)">40 sec</div>
+                                <div class="time-button" onclick="confirmStopTime(${index}, ${minutes}, 50)">50 sec</div>
+                            </div>
+                        </div>
+                    `;
+                    markers[index].setPopupContent(popupContent);
+                    markers[index].openPopup();
+
+                    L.DomEvent.disableClickPropagation(markers[index].getPopup().getElement());
+                    L.DomEvent.on(markers[index].getPopup().getElement(), 'click', L.DomEvent.stopPropagation);
+                }
+
+                window.confirmStopTime = function(index, minutes, seconds) {
+                    var totalStopTime = minutes * 60 + seconds;
+                    var marker = markers[index];
+                    var lat = marker.getLatLng().lat;
+                    var lon = marker.getLatLng().lng;
+
+                    marker.setPopupContent(`
+                        Index: ${index}<br>
+                        Latitude: ${lat}<br>
+                        Longitude: ${lon}<br>
+                        Speed: ${markers[index].options.speed} km/h<br>
+                        Stop Time: ${minutes} min ${seconds} sec<br>
+                        <button class="popup-button" onclick="setSpeed(${index})">Set Speed</button>
+                        <button class="popup-button" onclick="setStopTime(${index})">Set Stop Time</button>
+                        <button class="popup-button" onclick="deleteMarker(${index})">Delete Marker</button>
+                    `);
+                    marker.openPopup();
+
+                    markers[index].options.stop_time = totalStopTime;
+
+                    fetch('/update_marker', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json',
+                        },
+                        body: JSON.stringify({ index: index, lat: lat, lon: lon, speed: markers[index].options.speed, stop_time: totalStopTime }),
+                    }).then(() => drawSpline());
+                };
+            };
+
+            window.deleteMarker = function(index) {
+                var marker = markers[index];
+                map.removeLayer(marker);
+                delete markers[index];
+
+                for (let i = index + 1; i <= Object.keys(markers).length + 1; i++) {
+                    markers[i - 1] = markers[i];
+                    markers[i - 1].unbindPopup();
+                    markers[i - 1].bindPopup(getPopupContent(i - 1));
+                }
+
+                delete markers[Object.keys(markers).length + 1];
+                drawSpline();
+            };
+
+            document.addEventListener('keydown', function(event) {
+                if (event.ctrlKey && event.key === 'z') {
+                    undoLastMarker();
+                }
+            });
+
+            function undoLastMarker() {
+                var lastIndex = Object.keys(markers).length;
+                if (lastIndex > 0) {
+                    window.deleteMarker(lastIndex);
+                }
+            }
+
+            document.getElementById('sync-btn').addEventListener('click', function() {
+                var markerList = Object.values(markers).map(function(marker) {
+                    return {
+                        index: marker.options.index,
+                        lat: marker.getLatLng().lat,
+                        lon: marker.getLatLng().lng,
+                        speed: marker.options.speed,
+                        stop_time: marker.options.stop_time
+                    };
+                });
+
+                fetch('/delete_all_markers', {
+                    method: 'POST',
+                }).then(() => {
+                    markerList.forEach(function(marker) {
+                        fetch('/add_marker', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json',
+                            },
+                            body: JSON.stringify(marker),
+                        });
+                    });
+                });
+            });
+
+            document.getElementById('save-btn').addEventListener('click', function() {
+                fetch('/save_csv', {
+                    method: 'POST',
+                })
+                .then(response => response.blob())
+                .then(blob => {
+                    var url = window.URL.createObjectURL(blob);
+                    var a = document.createElement('a');
+                    a.href = url;
+                    a.download = "markers.csv";
+                    document.body.appendChild(a);
+                    a.click();
+                    a.remove();
+                });
+            });
+
+            document.getElementById('delete-all-btn').addEventListener('click', function() {
+                if (confirm("Are you sure you want to delete all markers?")) {
+                    for (var index in markers) {
+                        map.removeLayer(markers[index]);
+                    }
+                    markers = {};
+
+                    fetch('/delete_all_markers', {
+                        method: 'POST',
+                    }).then(() => drawSpline());
+                }
+            });
+        });
+    </script>
+</body>
+</html>
